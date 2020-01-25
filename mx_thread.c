@@ -254,3 +254,8 @@ void mx_semaphore_signal(mx_semaphore *s, uint32_t num)
 		mx_update_semaphore((uintptr_t)s, release);
 	}
 }
+
+int32_t mx_semaphore_get_count(const mx_semaphore *s)
+{
+	return mxa_load32(&s->count);
+}

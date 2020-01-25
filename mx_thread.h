@@ -21,6 +21,7 @@ struct mx_semaphore {
 void mx_semaphore_wait(mx_semaphore *s, uint32_t num);
 int mx_semaphore_try_wait(mx_semaphore *s, uint32_t num);
 void mx_semaphore_signal(mx_semaphore *s, uint32_t num);
+int32_t mx_semaphore_get_count(const mx_semaphore *s);
 
 #if 0
 
