@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// -- Configuration
+
+void mx_sync_set_default_spin(uint32_t spin);
+
 // -- Global semaphore pool
 // Returned indices are guaranteed to be around the same
 // as the number of concurrently allocated semaphores.
@@ -35,12 +43,10 @@ struct mx_mutex {
 };
 
 void mx_mutex_lock(mx_mutex *m);
-int mx_mutex_try_lock(mx_mutex *m);
 void mx_mutex_lock_spin(mx_mutex *m, uint32_t spin);
+int mx_mutex_try_lock(mx_mutex *m);
 void mx_mutex_unlock(mx_mutex *m);
 int mx_mutex_is_locked(mx_mutex *m);
-
-void mx_mutex_set_default_spin(uint32_t spin);
 
 // -- Recursive mutex
 
@@ -66,9 +72,35 @@ struct mx_semaphore {
 };
 
 void mx_semaphore_wait(mx_semaphore *s);
+void mx_semaphore_wait_spin(mx_semaphore *s, uint32_t spin);
+int mx_semaphore_try_wait(mx_semaphore *s);
 void mx_semaphore_signal(mx_semaphore *s);
 void mx_semaphore_wait_n(mx_semaphore *s, uint32_t num);
+void mx_semaphore_wait_n_spin(mx_semaphore *s, uint32_t num, uint32_t spin);
+int mx_semaphore_try_wait_n(mx_semaphore *s, uint32_t num);
 void mx_semaphore_signal_n(mx_semaphore *s, uint32_t num);
 int32_t mx_semaphore_get_count(mx_semaphore *s);
+
+// -- Read/write mutex
+
+typedef struct mx_rw_mutex mx_rw_mutex;
+struct mx_rw_mutex {
+	mx_mutex writer_mutex;
+	uint32_t num_readers;
+	uint32_t num_pending_readers;
+	mx_semaphore reader_sem;
+	mx_semaphore writer_sem;
+};
+
+void mx_rw_mutex_lock_read(mx_rw_mutex *m);
+int mx_rw_mutex_try_lock_read(mx_rw_mutex *m);
+void mx_rw_mutex_unlock_read(mx_rw_mutex *m);
+void mx_rw_mutex_lock_write(mx_rw_mutex *m);
+int mx_rw_mutex_try_lock_write(mx_rw_mutex *m);
+void mx_rw_mutex_unlock_write(mx_rw_mutex *m);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

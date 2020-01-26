@@ -1,11 +1,24 @@
 #include "mx_sync.h"
 #include "mx_platform.h"
 
-#ifndef MX_MUTEX_DEFAULT_SPIN
-#define MX_MUTEX_DEFAULT_SPIN 500
+#ifndef MX_SYNC_DEFAULT_SPIN
+#define MX_SYNC_DEFAULT_SPIN 500
 #endif
 
 #include <stdlib.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// -- Configuration
+
+static uint32_t g_default_spin = MX_SYNC_DEFAULT_SPIN;
+
+void mx_sync_set_default_spin(uint32_t spin)
+{
+	g_default_spin = spin;
+}
 
 // -- Semaphore pool
 // Global semaphore pool that supports lock-free allocation and recycling
@@ -77,6 +90,19 @@ uint32_t mx_sema_pool_alloc()
 		block = next;
 		base += 32;
 	}
+}
+
+static mx_forceinline sema_block *resolve_sema(uint32_t *p_ix)
+{
+	sema_block *block = &g_sema_root;
+	uint32_t ix = *p_ix - 1; // < Indices are 1-based
+	while (ix >= 32) {
+		// No fence is needed as having `ix` fences the block
+		block = mxa_load_ptr_nf(&block->next);
+		ix -= 32;
+	}
+	*p_ix = ix;
+	return block;
 }
 
 void mx_sema_pool_free(uint32_t ix)
@@ -216,8 +242,6 @@ void mx_pooled_sema_signal_n(mx_pooled_sema *ps, uint32_t num)
 
 // -- mx_mutex
 
-static uint32_t g_default_spin = MX_MUTEX_DEFAULT_SPIN;
-
 static mx_noinline void mutex_lock_slow_spin(mx_mutex *m, uint32_t spin)
 {
 	for (;;) {
@@ -250,7 +274,7 @@ static mx_noinline void mutex_lock_slow_spin(mx_mutex *m, uint32_t spin)
 				uint32_t sema = mx_sema_pool_alloc();
 				// m->state: vvv sema vvv
 				if (mxa_cas32_rel(&m->state, state, 1 | (sema << 16u))) {
-					// OK: Locked -> Semaphore
+					// OK: Locked -> Semaphore (1 ref)
 					mx_sema_pool_wait(sema);
 					return;
 				} else {
@@ -319,12 +343,6 @@ void mx_mutex_lock(mx_mutex *m)
 	// m->state: ^^^ ^^^
 }
 
-int mx_mutex_try_lock(mx_mutex *m)
-{
-	return mxa_cas32_acq(&m->state, 0, 1);
-	// m->state: ^^^ ^^^
-}
-
 void mx_mutex_lock_spin(mx_mutex *m, uint32_t spin)
 {
 	if (!mxa_cas32_acq(&m->state, 0, 1)) {
@@ -332,11 +350,17 @@ void mx_mutex_lock_spin(mx_mutex *m, uint32_t spin)
 	}
 }
 
+int mx_mutex_try_lock(mx_mutex *m)
+{
+	return mxa_cas32_acq(&m->state, 0, 1);
+	// m->state: ^^^ ^^^
+}
+
 void mx_mutex_unlock(mx_mutex *m)
 {
 	// m->state: vvv vvv
 	if (!mxa_cas32_rel(&m->state, 1, 0)) {
-		mutex_lock_slow(m);
+		mutex_unlock_slow(m);
 	}
 }
 
@@ -344,11 +368,6 @@ int mx_mutex_is_locked(mx_mutex *m)
 {
 	return mxa_load32_acq(&m->state) != 0 ? 1 : 0;
 	// m->state: ^^^ ^^^
-}
-
-void mx_mutex_set_default_spin(uint32_t spin)
-{
-	g_default_spin = spin;
 }
 
 // -- Recursive mutex
@@ -362,7 +381,7 @@ uint32_t mx_recursive_mutex_lock(mx_recursive_mutex *m)
 	} else if (m->thread_id == thread_id) {
 		return ++m->recursion_depth + 1;
 	}
-	mutex_lock_slow(m);
+	mutex_lock_slow(&m->mutex);
 	m->thread_id = thread_id;
 	return 1;
 }
@@ -389,7 +408,7 @@ uint32_t mx_recursive_mutex_lock_spin(mx_recursive_mutex *m, uint32_t spin)
 	} else if (m->thread_id == thread_id) {
 		return ++m->recursion_depth + 1;
 	}
-	mutex_lock_slow_spin(m, spin);
+	mutex_lock_slow_spin(&m->mutex, spin);
 	m->thread_id = thread_id;
 	return 1;
 }
@@ -419,22 +438,166 @@ uint32_t mx_recursive_mutex_get_depth(mx_recursive_mutex *m)
 
 // -- Semaphore
 
+static mx_forceinline int semaphore_spin(mx_semaphore *s, uint32_t num, uint32_t spin)
+{
+	while (spin-- > 0) {
+		int32_t count = (int32_t)mxa_load32_nf((uint32_t*)&s->count);
+		if (count >= (int32_t)num) {
+			if (mxa_cas32_acq(&s->count, (uint32_t)count, (uint32_t)count - num)) {
+				// s->count: ^^^ ^^^
+				return 1;
+			}
+		}
+		mx_yield();
+	}
+	return 0;
+}
+
 void mx_semaphore_wait(mx_semaphore *s)
 {
+	if (semaphore_spin(s, 1, g_default_spin)) return;
+	int32_t count = (int32_t)mxa_dec32_acq((uint32_t*)&s->count) - 1;
+	// s->count: ^^^ ^^^
+	if (count < 0) {
+		mx_pooled_sema_wait(&s->sema);
+	}
+}
+
+void mx_semaphore_wait_spin(mx_semaphore *s, uint32_t spin)
+{
+	if (semaphore_spin(s, 1, spin)) return;
+	int32_t count = (int32_t)mxa_dec32_acq((uint32_t*)&s->count) - 1;
+	// s->count: ^^^ ^^^
+	if (count < 0) {
+		mx_pooled_sema_wait(&s->sema);
+	}
+}
+
+int mx_semaphore_try_wait(mx_semaphore *s)
+{
+	int32_t count = (int32_t)mxa_load32_nf((uint32_t*)&s->count);
+	if (count <= 0) return 0;
+	return mxa_cas32_acq((uint32_t*)&s->count, (uint32_t)count, (uint32_t)(count - 1));
+	// s->count: ^^^ ^^^
 }
 
 void mx_semaphore_signal(mx_semaphore *s)
 {
+	// s->count: vvv vvv
+	int32_t count = (int32_t)mxa_inc32_rel((uint32_t*)&s->count);
+	if (count < 0) {
+		mx_pooled_sema_signal(&s->sema);
+	}
 }
 
 void mx_semaphore_wait_n(mx_semaphore *s, uint32_t num)
 {
+	if (semaphore_spin(s, num, g_default_spin)) return;
+	int32_t count = (int32_t)mxa_sub32_acq((uint32_t*)&s->count, num) - (int32_t)num;
+	// s->count: ^^^ ^^^
+	if (count < 0) {
+		int32_t num_wait = -count <= (int32_t)num ? -count : (int32_t)num;
+		mx_pooled_sema_wait_n(&s->sema, (uint32_t)num_wait);
+	}
+}
+
+void mx_semaphore_wait_n_spin(mx_semaphore *s, uint32_t num, uint32_t spin)
+{
+	if (semaphore_spin(s, num, spin)) return;
+	int32_t count = (int32_t)mxa_sub32_acq((uint32_t*)&s->count, num) - (int32_t)num;
+	// s->count: ^^^ ^^^
+	if (count < 0) {
+		int32_t num_wait = -count <= (int32_t)num ? -count : (int32_t)num;
+		mx_pooled_sema_wait_n(&s->sema, (uint32_t)num_wait);
+	}
+}
+
+int mx_semaphore_try_wait_n(mx_semaphore *s, uint32_t num)
+{
+	int32_t count = (int32_t)mxa_load32_nf((uint32_t*)&s->count);
+	if (count < (int32_t)num) return 0;
+	return mxa_cas32_acq((uint32_t*)&s->count, (uint32_t)count, (uint32_t)count - num);
+	// s->count: ^^^ ^^^
 }
 
 void mx_semaphore_signal_n(mx_semaphore *s, uint32_t num)
 {
+	// s->count: vvv vvv
+	int32_t count = (int32_t)mxa_add32_rel((uint32_t*)&s->count, num);
+	if (count < 0) {
+		int32_t num_release = -count <= (int32_t)num ? -count : (int32_t)num;
+		mx_pooled_sema_signal_n(&s->sema, (uint32_t)num_release);
+	}
 }
 
 int32_t mx_semaphore_get_count(mx_semaphore *s)
 {
+	return (int32_t)mxa_load32_acq((uint32_t*)&s->count);
+	// s->count: ^^^ ^^^
 }
+
+// -- Read/write mutex
+
+#define MAX_READERS (int32_t)(1 << 30)
+
+void mx_rw_mutex_lock_read(mx_rw_mutex *m)
+{
+	int32_t count = (int32_t)mxa_inc32_acq(&m->num_readers) + 1;
+	// m->num_readers: ^^^ ^^^
+	if (count < 0) {
+		mx_semaphore_wait(&m->reader_sem);
+	}
+}
+
+int mx_rw_mutex_try_lock_read(mx_rw_mutex *m)
+{
+	int32_t count = (int32_t)mxa_load32_nf(&m->num_readers);
+	if (count < 0) return 0;
+	return mxa_cas32_acq(&m->num_readers, (uint32_t)count, (uint32_t)count + 1);
+	// m->num_readers: ^^^ ^^^
+}
+
+void mx_rw_mutex_unlock_read(mx_rw_mutex *m)
+{
+	int32_t count = (int32_t)mxa_dec32_nf(&m->num_readers) - 1;
+	if (count < 0 && mxa_dec32_nf(&m->num_pending_readers) - 1 == 0) {
+		mx_semaphore_signal(&m->writer_sem);
+	}
+}
+
+void mx_rw_mutex_lock_write(mx_rw_mutex *m)
+{
+	mx_mutex_lock(&m->writer_mutex);
+	int32_t count = (int32_t)mxa_sub32_nf(&m->num_readers, MAX_READERS);
+	if (count > 0) {
+		uint32_t num_wait = mxa_add32_nf(&m->num_pending_readers, (uint32_t)count) + (uint32_t)count;
+		if (num_wait > 0) {
+			mx_semaphore_wait(&m->writer_sem);
+		}
+	}
+}
+
+int mx_rw_mutex_try_lock_write(mx_rw_mutex *m)
+{
+	if (mxa_load32_nf(&m->num_readers) != 0) return 0;
+	if (!mx_mutex_try_lock(&m->writer_mutex)) return 0;
+	if (!mxa_cas32_nf(&m->num_readers, 0, (uint32_t)-MAX_READERS)) {
+		mx_mutex_unlock(&m->writer_mutex);
+		return 0;
+	}
+	return 1;
+}
+
+void mx_rw_mutex_unlock_write(mx_rw_mutex *m)
+{
+	// m->num_readers: vvv vvv
+	int32_t count = (int32_t)mxa_add32_rel((uint32_t*)&m->num_readers, MAX_READERS) + MAX_READERS;
+	if (count > 0) {
+		mx_semaphore_signal_n(&m->reader_sem, count);
+	}
+	mx_mutex_unlock(&m->writer_mutex);
+}
+
+#ifdef __cplusplus
+}
+#endif
